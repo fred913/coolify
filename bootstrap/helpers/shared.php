@@ -1956,7 +1956,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                     }
                 }
                 $parsedServiceVariables->put('COOLIFY_RESOURCE_UUID', "{$resource->uuid}");
-                $parsedServiceVariables->put('COOLIFY_CONTAINER_NAME', "$serviceName-{$resource->uuid}");
+                // $parsedServiceVariables->put('COOLIFY_CONTAINER_NAME', "$serviceName-{$resource->uuid}");
 
                 // TODO: move this in a shared function
                 if (! $parsedServiceVariables->has('COOLIFY_APP_NAME')) {

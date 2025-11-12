@@ -1040,9 +1040,9 @@ function applicationParser(Application $resource, int $pull_request_id = 0, ?int
         }
 
         // Add COOLIFY_CONTAINER_NAME to environment
-        if ($resource->environment_variables->where('key', 'COOLIFY_CONTAINER_NAME')->isEmpty()) {
-            $coolifyEnvironments->put('COOLIFY_CONTAINER_NAME', "{$containerName}");
-        }
+        // if ($resource->environment_variables->where('key', 'COOLIFY_CONTAINER_NAME')->isEmpty()) {
+        //     $coolifyEnvironments->put('COOLIFY_CONTAINER_NAME', "{$containerName}");
+        // }
 
         if ($isPullRequest) {
             $preview = $resource->previews()->find($preview_id);
@@ -2105,9 +2105,9 @@ function serviceParser(Service $resource): Collection
         }
 
         // Add COOLIFY_CONTAINER_NAME to environment
-        if ($resource->environment_variables->where('key', 'COOLIFY_CONTAINER_NAME')->isEmpty()) {
-            $coolifyEnvironments->put('COOLIFY_CONTAINER_NAME', "{$containerName}");
-        }
+        // if ($resource->environment_variables->where('key', 'COOLIFY_CONTAINER_NAME')->isEmpty()) {
+        //     $coolifyEnvironments->put('COOLIFY_CONTAINER_NAME', "{$containerName}");
+        // }
 
         if ($savedService->serviceType()) {
             $fqdns = generateServiceSpecificFqdns($savedService);
