@@ -24,6 +24,7 @@ use OpenApi\Attributes as OA;
         'key' => ['type' => 'string'],
         'value' => ['type' => 'string'],
         'real_value' => ['type' => 'string'],
+        'comment' => ['type' => 'string', 'nullable' => true],
         'version' => ['type' => 'string'],
         'created_at' => ['type' => 'string'],
         'updated_at' => ['type' => 'string'],
@@ -31,7 +32,30 @@ use OpenApi\Attributes as OA;
 )]
 class EnvironmentVariable extends BaseModel
 {
-    protected $guarded = [];
+    protected $fillable = [
+        // Core identification
+        'key',
+        'value',
+        'comment',
+
+        // Polymorphic relationship
+        'resourceable_type',
+        'resourceable_id',
+
+        // Boolean flags
+        'is_preview',
+        'is_multiline',
+        'is_literal',
+        'is_runtime',
+        'is_buildtime',
+        'is_shown_once',
+        'is_shared',
+        'is_required',
+
+        // Metadata
+        'version',
+        'order',
+    ];
 
     protected $casts = [
         'key' => 'string',
@@ -65,6 +89,9 @@ class EnvironmentVariable extends BaseModel
                             'value' => $environment_variable->value,
                             'is_multiline' => $environment_variable->is_multiline ?? false,
                             'is_literal' => $environment_variable->is_literal ?? false,
+                            'is_runtime' => $environment_variable->is_runtime ?? false,
+                            'is_buildtime' => $environment_variable->is_buildtime ?? false,
+                            'comment' => $environment_variable->comment,
                             'resourceable_type' => Application::class,
                             'resourceable_id' => $environment_variable->resourceable_id,
                             'is_preview' => true,
@@ -121,6 +148,12 @@ class EnvironmentVariable extends BaseModel
                 }
 
                 $real_value = $this->get_real_environment_variables($this->value, $resource);
+
+                // Skip escaping for valid JSON objects/arrays to prevent quote corruption (see #6160)
+                if (json_validate($real_value) && (str_starts_with($real_value, '{') || str_starts_with($real_value, '['))) {
+                    return $real_value;
+                }
+
                 if ($this->is_literal || $this->is_multiline) {
                     $real_value = '\''.$real_value.'\'';
                 } else {
@@ -190,11 +223,11 @@ class EnvironmentVariable extends BaseModel
             return $environment_variable;
         }
         foreach ($sharedEnvsFound as $sharedEnv) {
-            $type = str($sharedEnv)->match('/(.*?)\./');
+            $type = str($sharedEnv)->trim()->match('/(.*?)\./');
             if (! collect(SHARED_VARIABLE_TYPES)->contains($type)) {
                 continue;
             }
-            $variable = str($sharedEnv)->match('/\.(.*)/');
+            $variable = str($sharedEnv)->trim()->match('/\.(.*)/');
             if ($type->value() === 'environment') {
                 $id = $resource->environment->id;
             } elseif ($type->value() === 'project') {
@@ -231,7 +264,7 @@ class EnvironmentVariable extends BaseModel
         $environment_variable = trim($environment_variable);
         $type = str($environment_variable)->after('{{')->before('.')->value;
         if (str($environment_variable)->startsWith('{{'.$type) && str($environment_variable)->endsWith('}}')) {
-            return encrypt((string) str($environment_variable)->replace(' ', ''));
+            return encrypt($environment_variable);
         }
 
         return encrypt($environment_variable);

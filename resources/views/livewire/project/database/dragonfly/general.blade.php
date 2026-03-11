@@ -103,7 +103,7 @@
                             <x-slot:title>Proxy Logs</x-slot:title>
                             <x-slot:content>
                                 <livewire:project.shared.get-logs :server="$server" :resource="$database"
-                                    container="{{ data_get($database, 'uuid') }}-proxy" lazy />
+                                    container="{{ data_get($database, 'uuid') }}-proxy" :collapsible="false" lazy />
                             </x-slot:content>
                             <x-forms.button disabled="{{ !$isPublic }}"
                                 @click="slideOverOpen=true">Logs</x-forms.button>
@@ -115,6 +115,8 @@
             </div>
             <x-forms.input placeholder="5432" disabled="{{ $isPublic }}" id="publicPort" label="Public Port"
                 canGate="update" :canResource="$database" />
+            <x-forms.input placeholder="3600" disabled="{{ $isPublic }}" id="publicPortTimeout"
+                label="Proxy Timeout (seconds)" helper="Timeout for the public TCP proxy connection in seconds. Default: 3600 (1 hour)." canGate="update" :canResource="$database" />
         </div>
     </form>
     <h3 class="pt-4">Advanced</h3>

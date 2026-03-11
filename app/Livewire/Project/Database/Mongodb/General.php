@@ -42,6 +42,8 @@ class General extends Component
 
     public ?int $publicPort = null;
 
+    public ?int $publicPortTimeout = 3600;
+
     public bool $isLogDrainEnabled = false;
 
     public ?string $customDockerRunOptions = null;
@@ -78,6 +80,7 @@ class General extends Component
             'portsMappings' => 'nullable',
             'isPublic' => 'nullable|boolean',
             'publicPort' => 'nullable|integer',
+            'publicPortTimeout' => 'nullable|integer|min:1',
             'isLogDrainEnabled' => 'nullable|boolean',
             'customDockerRunOptions' => 'nullable',
             'enableSsl' => 'boolean',
@@ -91,13 +94,13 @@ class General extends Component
             ValidationPatterns::combinedMessages(),
             [
                 'name.required' => 'The Name field is required.',
-                'name.regex' => 'The Name may only contain letters, numbers, spaces, dashes (-), underscores (_), dots (.), slashes (/), colons (:), and parentheses ().',
-                'description.regex' => 'The Description contains invalid characters. Only letters, numbers, spaces, and common punctuation (- _ . : / () \' " , ! ? @ # % & + = [] {} | ~ ` *) are allowed.',
                 'mongoInitdbRootUsername.required' => 'The Root Username field is required.',
                 'mongoInitdbRootPassword.required' => 'The Root Password field is required.',
                 'mongoInitdbDatabase.required' => 'The MongoDB Database field is required.',
                 'image.required' => 'The Docker Image field is required.',
                 'publicPort.integer' => 'The Public Port must be an integer.',
+                'publicPortTimeout.integer' => 'The Public Port Timeout must be an integer.',
+                'publicPortTimeout.min' => 'The Public Port Timeout must be at least 1.',
                 'sslMode.in' => 'The SSL Mode must be one of: allow, prefer, require, verify-full.',
             ]
         );
@@ -114,6 +117,7 @@ class General extends Component
         'portsMappings' => 'Port Mapping',
         'isPublic' => 'Is Public',
         'publicPort' => 'Public Port',
+        'publicPortTimeout' => 'Public Port Timeout',
         'customDockerRunOptions' => 'Custom Docker Run Options',
         'enableSsl' => 'Enable SSL',
         'sslMode' => 'SSL Mode',
@@ -155,6 +159,7 @@ class General extends Component
             $this->database->ports_mappings = $this->portsMappings;
             $this->database->is_public = $this->isPublic;
             $this->database->public_port = $this->publicPort;
+            $this->database->public_port_timeout = $this->publicPortTimeout;
             $this->database->is_log_drain_enabled = $this->isLogDrainEnabled;
             $this->database->custom_docker_run_options = $this->customDockerRunOptions;
             $this->database->enable_ssl = $this->enableSsl;
@@ -174,6 +179,7 @@ class General extends Component
             $this->portsMappings = $this->database->ports_mappings;
             $this->isPublic = $this->database->is_public;
             $this->publicPort = $this->database->public_port;
+            $this->publicPortTimeout = $this->database->public_port_timeout;
             $this->isLogDrainEnabled = $this->database->is_log_drain_enabled;
             $this->customDockerRunOptions = $this->database->custom_docker_run_options;
             $this->enableSsl = $this->database->enable_ssl;
@@ -237,22 +243,23 @@ class General extends Component
 
                 return;
             }
-            if ($this->isPublic) {
-                if (! str($this->database->status)->startsWith('running')) {
-                    $this->dispatch('error', 'Database must be started to be publicly accessible.');
-                    $this->isPublic = false;
+            if ($this->isPublic && ! str($this->database->status)->startsWith('running')) {
+                $this->dispatch('error', 'Database must be started to be publicly accessible.');
+                $this->isPublic = false;
 
-                    return;
-                }
+                return;
+            }
+            $this->syncData(true);
+            if ($this->isPublic) {
                 StartDatabaseProxy::run($this->database);
                 $this->dispatch('success', 'Database is now publicly accessible.');
             } else {
                 StopDatabaseProxy::run($this->database);
                 $this->dispatch('success', 'Database is no longer publicly accessible.');
             }
-            $this->syncData(true);
         } catch (\Throwable $e) {
             $this->isPublic = ! $this->isPublic;
+            $this->syncData(true);
 
             return handleError($e, $this);
         }

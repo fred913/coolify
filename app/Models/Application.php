@@ -6,6 +6,7 @@ use App\Enums\ApplicationDeploymentStatus;
 use App\Services\ConfigurationGenerator;
 use App\Traits\ClearsGlobalSearchCache;
 use App\Traits\HasConfiguration;
+use App\Traits\HasMetrics;
 use App\Traits\HasSafeStringAttribute;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -60,6 +61,8 @@ use Visus\Cuid2\Cuid2;
         'health_check_timeout' => ['type' => 'integer', 'description' => 'Health check timeout in seconds.'],
         'health_check_retries' => ['type' => 'integer', 'description' => 'Health check retries count.'],
         'health_check_start_period' => ['type' => 'integer', 'description' => 'Health check start period in seconds.'],
+        'health_check_type' => ['type' => 'string', 'description' => 'Health check type: http or cmd.', 'enum' => ['http', 'cmd']],
+        'health_check_command' => ['type' => 'string', 'nullable' => true, 'description' => 'Health check command for CMD type.'],
         'limits_memory' => ['type' => 'string', 'description' => 'Memory limit.'],
         'limits_memory_swap' => ['type' => 'string', 'description' => 'Memory swap limit.'],
         'limits_memory_swappiness' => ['type' => 'integer', 'description' => 'Memory swappiness.'],
@@ -111,7 +114,7 @@ use Visus\Cuid2\Cuid2;
 
 class Application extends BaseModel
 {
-    use ClearsGlobalSearchCache, HasConfiguration, HasFactory, HasSafeStringAttribute, SoftDeletes;
+    use ClearsGlobalSearchCache, HasConfiguration, HasFactory, HasMetrics, HasSafeStringAttribute, SoftDeletes;
 
     private static $parserVersion = '5';
 
@@ -121,6 +124,8 @@ class Application extends BaseModel
 
     protected $casts = [
         'http_basic_auth_password' => 'encrypted',
+        'restart_count' => 'integer',
+        'last_restart_at' => 'datetime',
     ];
 
     protected static function booted()
@@ -173,6 +178,39 @@ class Application extends BaseModel
             }
             if (count($payload) > 0) {
                 $application->forceFill($payload);
+            }
+
+            // Buildpack switching cleanup logic
+            if ($application->isDirty('build_pack')) {
+                $originalBuildPack = $application->getOriginal('build_pack');
+
+                // Clear Docker Compose specific data when switching away from dockercompose
+                if ($originalBuildPack === 'dockercompose') {
+                    $application->docker_compose_domains = null;
+                    $application->docker_compose_raw = null;
+
+                    // Remove SERVICE_FQDN_* and SERVICE_URL_* environment variables
+                    $application->environment_variables()
+                        ->where(function ($q) {
+                            $q->where('key', 'LIKE', 'SERVICE_FQDN_%')
+                                ->orWhere('key', 'LIKE', 'SERVICE_URL_%');
+                        })
+                        ->delete();
+                    $application->environment_variables_preview()
+                        ->where(function ($q) {
+                            $q->where('key', 'LIKE', 'SERVICE_FQDN_%')
+                                ->orWhere('key', 'LIKE', 'SERVICE_URL_%');
+                        })
+                        ->delete();
+                }
+
+                // Clear Dockerfile specific data when switching away from dockerfile
+                if ($originalBuildPack === 'dockerfile') {
+                    $application->dockerfile = null;
+                    $application->dockerfile_location = null;
+                    $application->dockerfile_target_build = null;
+                    $application->custom_healthcheck_found = false;
+                }
             }
         });
         static::created(function ($application) {
@@ -303,9 +341,23 @@ class Application extends BaseModel
         return Application::whereRelation('environment.project.team', 'id', $teamId)->orderBy('name');
     }
 
+    /**
+     * Get query builder for applications owned by current team.
+     * If you need all applications without further query chaining, use ownedByCurrentTeamCached() instead.
+     */
     public static function ownedByCurrentTeam()
     {
         return Application::whereRelation('environment.project.team', 'id', currentTeam()->id)->orderBy('name');
+    }
+
+    /**
+     * Get all applications owned by current team (cached for request duration).
+     */
+    public static function ownedByCurrentTeamCached()
+    {
+        return once(function () {
+            return Application::ownedByCurrentTeam()->get();
+        });
     }
 
     public function getContainersToStop(Server $server, bool $previewDeployments = false): array
@@ -634,21 +686,23 @@ class Application extends BaseModel
     {
         return Attribute::make(
             get: function () {
-                if (! $this->relationLoaded('additional_servers') || $this->additional_servers->count() === 0) {
-                    return $this->destination?->server?->isFunctional() ?? false;
+                // Check main server infrastructure health
+                $main_server_functional = $this->destination?->server?->isFunctional() ?? false;
+
+                if (! $main_server_functional) {
+                    return false;
                 }
 
-                $additional_servers_status = $this->additional_servers->pluck('pivot.status');
-                $main_server_status = $this->destination?->server?->isFunctional() ?? false;
-
-                foreach ($additional_servers_status as $status) {
-                    $server_status = str($status)->before(':')->value();
-                    if ($server_status !== 'running') {
-                        return false;
+                // Check additional servers infrastructure health (not container status!)
+                if ($this->relationLoaded('additional_servers') && $this->additional_servers->count() > 0) {
+                    foreach ($this->additional_servers as $server) {
+                        if (! $server->isFunctional()) {
+                            return false;  // Real server infrastructure problem
+                        }
                     }
                 }
 
-                return $main_server_status;
+                return true;
             }
         );
     }
@@ -772,18 +826,28 @@ class Application extends BaseModel
         return $this->settings->is_static ? [80] : $this->ports_exposes_array;
     }
 
+    public function detectPortFromEnvironment(?bool $isPreview = false): ?int
+    {
+        $envVars = $isPreview
+            ? $this->environment_variables_preview
+            : $this->environment_variables;
+
+        $portVar = $envVars->firstWhere('key', 'PORT');
+
+        if ($portVar && $portVar->real_value) {
+            $portValue = trim($portVar->real_value);
+            if (is_numeric($portValue)) {
+                return (int) $portValue;
+            }
+        }
+
+        return null;
+    }
+
     public function environment_variables()
     {
         return $this->morphMany(EnvironmentVariable::class, 'resourceable')
-            ->where('is_preview', false)
-            ->orderByRaw("
-                CASE
-                    WHEN is_required = true THEN 1
-                    WHEN LOWER(key) LIKE 'service_%' THEN 2
-                    ELSE 3
-                END,
-                LOWER(key) ASC
-            ");
+            ->where('is_preview', false);
     }
 
     public function runtime_environment_variables()
@@ -928,7 +992,7 @@ class Application extends BaseModel
         if (isDev() && data_get($this, 'private_key_id') === 0) {
             return 'deploy_key';
         }
-        if (data_get($this, 'private_key_id')) {
+        if (! is_null(data_get($this, 'private_key_id'))) {
             return 'deploy_key';
         } elseif (data_get($this, 'source')) {
             return 'source';
@@ -980,7 +1044,7 @@ class Application extends BaseModel
 
     public function isConfigurationChanged(bool $save = false)
     {
-        $newConfigHash = base64_encode($this->fqdn.$this->git_repository.$this->git_branch.$this->git_commit_sha.$this->build_pack.$this->static_image.$this->install_command.$this->build_command.$this->start_command.$this->ports_exposes.$this->ports_mappings.$this->custom_network_aliases.$this->base_directory.$this->publish_directory.$this->dockerfile.$this->dockerfile_location.$this->custom_labels.$this->custom_docker_run_options.$this->dockerfile_target_build.$this->redirect.$this->custom_nginx_configuration.$this->settings->use_build_secrets);
+        $newConfigHash = base64_encode($this->fqdn.$this->git_repository.$this->git_branch.$this->git_commit_sha.$this->build_pack.$this->static_image.$this->install_command.$this->build_command.$this->start_command.$this->ports_exposes.$this->ports_mappings.$this->custom_network_aliases.$this->base_directory.$this->publish_directory.$this->dockerfile.$this->dockerfile_location.$this->custom_labels.$this->custom_docker_run_options.$this->dockerfile_target_build.$this->redirect.$this->custom_nginx_configuration.$this->settings->use_build_secrets.$this->settings->inject_build_args_to_dockerfile.$this->settings->include_source_commit_in_build);
         if ($this->pull_request_id === 0 || $this->pull_request_id === null) {
             $newConfigHash .= json_encode($this->environment_variables()->get(['value',  'is_multiline', 'is_literal', 'is_buildtime', 'is_runtime'])->sort());
         } else {
@@ -1023,19 +1087,24 @@ class Application extends BaseModel
         return application_configuration_dir()."/{$this->uuid}";
     }
 
-    public function setGitImportSettings(string $deployment_uuid, string $git_clone_command, bool $public = false)
+    public function setGitImportSettings(string $deployment_uuid, string $git_clone_command, bool $public = false, ?string $commit = null)
     {
         $baseDir = $this->generateBaseDir($deployment_uuid);
         $escapedBaseDir = escapeshellarg($baseDir);
         $isShallowCloneEnabled = $this->settings?->is_git_shallow_clone_enabled ?? false;
 
-        if ($this->git_commit_sha !== 'HEAD') {
+        // Use the explicitly passed commit (e.g. from rollback), falling back to the application's git_commit_sha.
+        // Invalid refs will cause the git checkout/fetch command to fail on the remote server.
+        $commitToUse = $commit ?? $this->git_commit_sha;
+
+        if ($commitToUse !== 'HEAD') {
+            $escapedCommit = escapeshellarg($commitToUse);
             // If shallow clone is enabled and we need a specific commit,
             // we need to fetch that specific commit with depth=1
             if ($isShallowCloneEnabled) {
-                $git_clone_command = "{$git_clone_command} && cd {$escapedBaseDir} && GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\" git fetch --depth=1 origin {$this->git_commit_sha} && git -c advice.detachedHead=false checkout {$this->git_commit_sha} >/dev/null 2>&1";
+                $git_clone_command = "{$git_clone_command} && cd {$escapedBaseDir} && GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\" git fetch --depth=1 origin {$escapedCommit} && git -c advice.detachedHead=false checkout {$escapedCommit} >/dev/null 2>&1";
             } else {
-                $git_clone_command = "{$git_clone_command} && cd {$escapedBaseDir} && GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\" git -c advice.detachedHead=false checkout {$this->git_commit_sha} >/dev/null 2>&1";
+                $git_clone_command = "{$git_clone_command} && cd {$escapedBaseDir} && GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\" git -c advice.detachedHead=false checkout {$escapedCommit} >/dev/null 2>&1";
             }
         }
         if ($this->settings->is_git_submodules_enabled) {
@@ -1223,7 +1292,7 @@ class Application extends BaseModel
                     $escapedRepoUrl = escapeshellarg("{$this->source->html_url}/{$customRepository}");
                     $git_clone_command = "{$git_clone_command} {$escapedRepoUrl} {$escapedBaseDir}";
                     if (! $only_checkout) {
-                        $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command, public: true);
+                        $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command, public: true, commit: $commit);
                     }
                     if ($exec_in_docker) {
                         $commands->push(executeInDocker($deployment_uuid, $git_clone_command));
@@ -1244,7 +1313,7 @@ class Application extends BaseModel
                         $fullRepoUrl = $repoUrl;
                     }
                     if (! $only_checkout) {
-                        $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command, public: false);
+                        $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command, public: false, commit: $commit);
                     }
                     if ($exec_in_docker) {
                         $commands->push(executeInDocker($deployment_uuid, $git_clone_command));
@@ -1283,7 +1352,7 @@ class Application extends BaseModel
             if ($only_checkout) {
                 $git_clone_command = $git_clone_command_base;
             } else {
-                $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command_base);
+                $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command_base, commit: $commit);
             }
             if ($exec_in_docker) {
                 $commands = collect([
@@ -1341,7 +1410,7 @@ class Application extends BaseModel
             $fullRepoUrl = $customRepository;
             $escapedCustomRepository = escapeshellarg($customRepository);
             $git_clone_command = "{$git_clone_command} {$escapedCustomRepository} {$escapedBaseDir}";
-            $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command, public: true);
+            $git_clone_command = $this->setGitImportSettings($deployment_uuid, $git_clone_command, public: true, commit: $commit);
 
             if ($pull_request_id !== 0) {
                 if ($git_type === 'gitlab') {
@@ -1445,10 +1514,10 @@ class Application extends BaseModel
         instant_remote_process($commands, $this->destination->server, false);
     }
 
-    public function parse(int $pull_request_id = 0, ?int $preview_id = null)
+    public function parse(int $pull_request_id = 0, ?int $preview_id = null, ?string $commit = null)
     {
         if ((int) $this->compose_parsing_version >= 3) {
-            return applicationParser($this, $pull_request_id, $preview_id);
+            return applicationParser($this, $pull_request_id, $preview_id, $commit);
         } elseif ($this->docker_compose_raw) {
             return parseDockerComposeFile(resource: $this, isNew: false, pull_request_id: $pull_request_id, preview_id: $preview_id);
         } else {
@@ -1456,9 +1525,11 @@ class Application extends BaseModel
         }
     }
 
-    public function loadComposeFile($isInit = false)
+    public function loadComposeFile($isInit = false, ?string $restoreBaseDirectory = null, ?string $restoreDockerComposeLocation = null)
     {
-        $initialDockerComposeLocation = $this->docker_compose_location;
+        // Use provided restore values or capture current values as fallback
+        $initialDockerComposeLocation = $restoreDockerComposeLocation ?? $this->docker_compose_location;
+        $initialBaseDirectory = $restoreBaseDirectory ?? $this->base_directory;
         if ($isInit && $this->docker_compose_raw) {
             return;
         }
@@ -1513,6 +1584,11 @@ class Application extends BaseModel
         try {
             $composeFileContent = instant_remote_process($commands, $this->destination->server);
         } catch (\Exception $e) {
+            // Restore original values on failure only
+            $this->docker_compose_location = $initialDockerComposeLocation;
+            $this->base_directory = $initialBaseDirectory;
+            $this->save();
+
             if (str($e->getMessage())->contains('No such file')) {
                 throw new \RuntimeException("Docker Compose file not found at: $workdir$composeFile<br><br>Check if you used the right extension (.yaml or .yml) in the compose file name.");
             }
@@ -1524,8 +1600,7 @@ class Application extends BaseModel
             }
             throw new \RuntimeException($e->getMessage());
         } finally {
-            $this->docker_compose_location = $initialDockerComposeLocation;
-            $this->save();
+            // Cleanup only - restoration happens in catch block
             $commands = collect([
                 "rm -rf /tmp/{$uuid}",
             ]);
@@ -1571,6 +1646,11 @@ class Application extends BaseModel
                 'initialDockerComposeLocation' => $this->docker_compose_location,
             ];
         } else {
+            // Restore original values before throwing
+            $this->docker_compose_location = $initialDockerComposeLocation;
+            $this->base_directory = $initialBaseDirectory;
+            $this->save();
+
             throw new \RuntimeException("Docker Compose file not found at: $workdir$composeFile<br><br>Check if you used the right extension (.yaml or .yml) in the compose file name.");
         }
     }
@@ -1586,7 +1666,7 @@ class Application extends BaseModel
             $this->custom_labels = base64_encode($customLabels);
         }
         $customLabels = base64_decode($this->custom_labels);
-        if (mb_detect_encoding($customLabels, 'ASCII', true) === false) {
+        if (mb_detect_encoding($customLabels, 'UTF-8', true) === false) {
             $customLabels = str(implode('|coolify|', generateLabelsApplication($this, $preview)))->replace('|coolify|', "\n");
         }
         $this->custom_labels = base64_encode($customLabels);
@@ -1883,65 +1963,6 @@ class Application extends BaseModel
                     $this->save();
                 }
             }
-        }
-    }
-
-    public static function getDomainsByUuid(string $uuid): array
-    {
-        $application = self::where('uuid', $uuid)->first();
-
-        if ($application) {
-            return $application->fqdns;
-        }
-
-        return [];
-    }
-
-    public function getCpuMetrics(int $mins = 5)
-    {
-        $server = $this->destination->server;
-        $container_name = $this->uuid;
-        if ($server->isMetricsEnabled()) {
-            $from = now()->subMinutes($mins)->toIso8601ZuluString();
-            $metrics = instant_remote_process(["docker exec coolify-sentinel sh -c 'curl -H \"Authorization: Bearer {$server->settings->sentinel_token}\" http://localhost:8888/api/container/{$container_name}/cpu/history?from=$from'"], $server, false);
-            if (str($metrics)->contains('error')) {
-                $error = json_decode($metrics, true);
-                $error = data_get($error, 'error', 'Something is not okay, are you okay?');
-                if ($error === 'Unauthorized') {
-                    $error = 'Unauthorized, please check your metrics token or restart Sentinel to set a new token.';
-                }
-                throw new \Exception($error);
-            }
-            $metrics = json_decode($metrics, true);
-            $parsedCollection = collect($metrics)->map(function ($metric) {
-                return [(int) $metric['time'], (float) $metric['percent']];
-            });
-
-            return $parsedCollection->toArray();
-        }
-    }
-
-    public function getMemoryMetrics(int $mins = 5)
-    {
-        $server = $this->destination->server;
-        $container_name = $this->uuid;
-        if ($server->isMetricsEnabled()) {
-            $from = now()->subMinutes($mins)->toIso8601ZuluString();
-            $metrics = instant_remote_process(["docker exec coolify-sentinel sh -c 'curl -H \"Authorization: Bearer {$server->settings->sentinel_token}\" http://localhost:8888/api/container/{$container_name}/memory/history?from=$from'"], $server, false);
-            if (str($metrics)->contains('error')) {
-                $error = json_decode($metrics, true);
-                $error = data_get($error, 'error', 'Something is not okay, are you okay?');
-                if ($error === 'Unauthorized') {
-                    $error = 'Unauthorized, please check your metrics token or restart Sentinel to set a new token.';
-                }
-                throw new \Exception($error);
-            }
-            $metrics = json_decode($metrics, true);
-            $parsedCollection = collect($metrics)->map(function ($metric) {
-                return [(int) $metric['time'], (float) $metric['used']];
-            });
-
-            return $parsedCollection->toArray();
         }
     }
 

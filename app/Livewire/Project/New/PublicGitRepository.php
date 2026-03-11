@@ -70,7 +70,7 @@ class PublicGitRepository extends Component
         'publish_directory' => 'nullable|string',
         'build_pack' => 'required|string',
         'base_directory' => 'nullable|string',
-        'docker_compose_location' => 'nullable|string',
+        'docker_compose_location' => ['nullable', 'string', 'max:255', 'regex:/^\/[a-zA-Z0-9._\-\/]+$/'],
     ];
 
     protected function rules()
@@ -82,7 +82,7 @@ class PublicGitRepository extends Component
             'publish_directory' => 'nullable|string',
             'build_pack' => 'required|string',
             'base_directory' => 'nullable|string',
-            'docker_compose_location' => 'nullable|string',
+            'docker_compose_location' => ['nullable', 'string', 'max:255', 'regex:/^\/[a-zA-Z0-9._\-\/]+$/'],
             'git_branch' => ['required', 'string', new ValidGitBranch],
         ];
     }
@@ -105,26 +105,6 @@ class PublicGitRepository extends Component
         }
         $this->parameters = get_route_parameters();
         $this->query = request()->query();
-    }
-
-    public function updatedBaseDirectory()
-    {
-        if ($this->base_directory) {
-            $this->base_directory = rtrim($this->base_directory, '/');
-            if (! str($this->base_directory)->startsWith('/')) {
-                $this->base_directory = '/'.$this->base_directory;
-            }
-        }
-    }
-
-    public function updatedDockerComposeLocation()
-    {
-        if ($this->docker_compose_location) {
-            $this->docker_compose_location = rtrim($this->docker_compose_location, '/');
-            if (! str($this->docker_compose_location)->startsWith('/')) {
-                $this->docker_compose_location = '/'.$this->docker_compose_location;
-            }
-        }
     }
 
     public function updatedBuildPack()

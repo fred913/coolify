@@ -49,7 +49,9 @@ class Team extends Model implements SendsDiscord, SendsEmail, SendsPushover, Sen
     protected static function booted()
     {
         static::created(function ($team) {
-            $team->emailNotificationSettings()->create();
+            $team->emailNotificationSettings()->create([
+                'use_instance_email_settings' => isDev(),
+            ]);
             $team->discordNotificationSettings()->create();
             $team->slackNotificationSettings()->create();
             $team->telegramNotificationSettings()->create();
@@ -189,7 +191,8 @@ class Team extends Model implements SendsDiscord, SendsEmail, SendsPushover, Sen
             $this->getNotificationSettings('discord')?->isEnabled() ||
             $this->getNotificationSettings('slack')?->isEnabled() ||
             $this->getNotificationSettings('telegram')?->isEnabled() ||
-            $this->getNotificationSettings('pushover')?->isEnabled();
+            $this->getNotificationSettings('pushover')?->isEnabled() ||
+            $this->getNotificationSettings('webhook')?->isEnabled();
     }
 
     public function subscriptionEnded()

@@ -63,16 +63,25 @@ class DockerCompose extends Component
             ]);
 
             $variables = parseEnvFormatToArray($this->envFile);
-            foreach ($variables as $key => $variable) {
+            foreach ($variables as $key => $data) {
+                // Extract value and comment from parsed data
+                // Handle both array format ['value' => ..., 'comment' => ...] and plain string values
+                $value = is_array($data) ? ($data['value'] ?? '') : $data;
+                $comment = is_array($data) ? ($data['comment'] ?? null) : null;
+
                 EnvironmentVariable::create([
                     'key' => $key,
-                    'value' => $variable,
+                    'value' => $value,
+                    'comment' => $comment,
                     'is_preview' => false,
                     'resourceable_id' => $service->id,
                     'resourceable_type' => $service->getMorphClass(),
                 ]);
             }
             $service->parse(isNew: true);
+
+            // Apply service-specific application prerequisites
+            applyServiceApplicationPrerequisites($service);
 
             return redirect()->route('project.service.configuration', [
                 'service_uuid' => $service->uuid,

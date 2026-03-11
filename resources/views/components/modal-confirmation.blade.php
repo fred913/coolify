@@ -29,17 +29,23 @@
 
 @php
     use App\Models\InstanceSettings;
+    // Global setting to disable ALL two-step confirmation (text + password)
     $disableTwoStepConfirmation = data_get(InstanceSettings::get(), 'disable_two_step_confirmation');
+    // Skip ONLY password confirmation for OAuth users (they have no password)
+    $skipPasswordConfirmation = shouldSkipPasswordConfirmation();
     if ($temporaryDisableTwoStepConfirmation) {
         $disableTwoStepConfirmation = false;
+        // Password confirmation requirement is not affected by temporary two-step disable
     }
+    // When password step is skipped, Step 2 becomes final - change button text from "Continue" to "Confirm"
+    $effectiveStep2ButtonText = ($skipPasswordConfirmation && $step2ButtonText === 'Continue') ? 'Confirm' : $step2ButtonText;
 @endphp
 
 <div {{ $ignoreWire ? 'wire:ignore' : '' }} x-data="{
     modalOpen: false,
     step: {{ empty($checkboxes) ? 2 : 1 }},
     initialStep: {{ empty($checkboxes) ? 2 : 1 }},
-    finalStep: {{ $confirmWithPassword && !$disableTwoStepConfirmation ? 3 : 2 }},
+    finalStep: {{ $confirmWithPassword && !$skipPasswordConfirmation ? 3 : 2 }},
     deleteText: '',
     password: '',
     actions: @js($actions),
@@ -50,25 +56,28 @@
     })(),
     userConfirmationText: '',
     confirmWithText: @js($confirmWithText && !$disableTwoStepConfirmation),
-    confirmWithPassword: @js($confirmWithPassword && !$disableTwoStepConfirmation),
+    confirmWithPassword: @js($confirmWithPassword && !$skipPasswordConfirmation),
     submitAction: @js($submitAction),
     dispatchAction: @js($dispatchAction),
+    submitting: false,
     passwordError: '',
     selectedActions: @js(collect($checkboxes)->pluck('id')->filter(fn($id) => $this->$id)->values()->all()),
     dispatchEvent: @js($dispatchEvent),
     dispatchEventType: @js($dispatchEventType),
     dispatchEventMessage: @js($dispatchEventMessage),
     disableTwoStepConfirmation: @js($disableTwoStepConfirmation),
+    skipPasswordConfirmation: @js($skipPasswordConfirmation),
     resetModal() {
         this.step = this.initialStep;
         this.deleteText = '';
         this.password = '';
+        this.submitting = false;
         this.userConfirmationText = '';
         this.selectedActions = @js(collect($checkboxes)->pluck('id')->filter(fn($id) => $this->$id)->values()->all());
         $wire.$refresh();
     },
     step1ButtonText: @js($step1ButtonText),
-    step2ButtonText: @js($step2ButtonText),
+    step2ButtonText: @js($effectiveStep2ButtonText),
     step3ButtonText: @js($step3ButtonText),
     validatePassword() {
         if (this.confirmWithPassword && !this.password) {
@@ -92,10 +101,14 @@
         const paramsMatch = this.submitAction.match(/\((.*?)\)/);
         const params = paramsMatch ? paramsMatch[1].split(',').map(param => param.trim()) : [];
 
-        if (this.confirmWithPassword) {
-            params.push(this.password);
+        // Always pass password parameter (empty string if password confirmation is skipped)
+        // This ensures consistent method signature for backend Livewire methods
+        params.push(this.confirmWithPassword ? this.password : '');
+
+        // Only pass selectedActions if there are checkboxes with selections
+        if (this.selectedActions.length > 0) {
+            params.push(this.selectedActions);
         }
-        params.push(this.selectedActions);
         return $wire[methodName](...params)
             .then(result => {
                 if (result === true) {
@@ -309,28 +322,34 @@
                                 </x-forms.button>
                             @endif
                             <x-forms.button
-                                x-bind:disabled="!disableTwoStepConfirmation && confirmWithText && userConfirmationText !==
-                                    confirmationText"
+                                x-bind:disabled="submitting || (!disableTwoStepConfirmation && confirmWithText && userConfirmationText !==
+                                    confirmationText)"
                                 class="w-auto" isError
                                 @click="
                                     if (dispatchEvent) {
                                         $wire.dispatch(dispatchEventType, dispatchEventMessage);
                                     }
-                                    if (confirmWithPassword && !disableTwoStepConfirmation) {
+                                    if (confirmWithPassword && !skipPasswordConfirmation) {
                                         step++;
                                     } else {
-                                        modalOpen = false;
-                                        resetModal();
-                                        submitForm();
+                                        submitting = true;
+                                        submitForm().then((result) => {
+                                            submitting = false;
+                                            modalOpen = false;
+                                            resetModal();
+                                        }).catch(() => {
+                                            submitting = false;
+                                        });
                                     }
                                 ">
-                                <span x-text="step2ButtonText"></span>
+                                <span x-show="!submitting" x-text="step2ButtonText"></span>
+                                <x-loading x-show="submitting" text="Processing..." />
                             </x-forms.button>
                         </div>
                     </div>
 
                     <!-- Step 3: Password confirmation -->
-                    @if (!$disableTwoStepConfirmation)
+                    @if (!$skipPasswordConfirmation)
                         <div x-show="step === 3 && confirmWithPassword">
                             <x-callout type="danger" title="Final Confirmation" class="mb-4">
                                 Please enter your password to confirm this destructive action.
@@ -362,22 +381,27 @@
                                     class="w-24 dark:bg-coolgray-200 dark:hover:bg-coolgray-300">
                                     Back
                                 </x-forms.button>
-                                <x-forms.button x-bind:disabled="!password" class="w-auto" isError
+                                <x-forms.button x-bind:disabled="!password || submitting" class="w-auto" isError
                                     @click="
                                     if (dispatchEvent) {
                                         $wire.dispatch(dispatchEventType, dispatchEventMessage);
                                     }
+                                    submitting = true;
                                     submitForm().then((result) => {
+                                        submitting = false;
                                         if (result === true) {
                                             modalOpen = false;
                                             resetModal();
                                         } else {
                                             passwordError = result;
-                                            password = ''; // Clear the password field
+                                            password = '';
                                         }
+                                    }).catch(() => {
+                                        submitting = false;
                                     });
                                     ">
-                                    <span x-text="step3ButtonText"></span>
+                                    <span x-show="!submitting" x-text="step3ButtonText"></span>
+                                    <x-loading x-show="submitting" text="Processing..." />
                                 </x-forms.button>
                             </div>
                         </div>

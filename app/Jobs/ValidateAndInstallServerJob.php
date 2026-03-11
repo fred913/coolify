@@ -8,13 +8,14 @@ use App\Events\ServerReachabilityChanged;
 use App\Events\ServerValidated;
 use App\Models\Server;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldBeEncrypted;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 
-class ValidateAndInstallServerJob implements ShouldQueue
+class ValidateAndInstallServerJob implements ShouldBeEncrypted, ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
@@ -68,6 +69,42 @@ class ValidateAndInstallServerJob implements ShouldQueue
                 Log::error('ValidateAndInstallServer: OS not supported', [
                     'server_id' => $this->server->id,
                 ]);
+
+                return;
+            }
+
+            // Check and install prerequisites
+            $validationResult = $this->server->validatePrerequisites();
+            if (! $validationResult['success']) {
+                if ($this->numberOfTries >= $this->maxTries) {
+                    $missingCommands = implode(', ', $validationResult['missing']);
+                    $errorMessage = "Prerequisites ({$missingCommands}) could not be installed after {$this->maxTries} attempts. Please install them manually before continuing.";
+                    $this->server->update([
+                        'validation_logs' => $errorMessage,
+                        'is_validating' => false,
+                    ]);
+                    Log::error('ValidateAndInstallServer: Prerequisites installation failed after max tries', [
+                        'server_id' => $this->server->id,
+                        'attempts' => $this->numberOfTries,
+                        'missing_commands' => $validationResult['missing'],
+                        'found_commands' => $validationResult['found'],
+                    ]);
+
+                    return;
+                }
+
+                Log::info('ValidateAndInstallServer: Installing prerequisites', [
+                    'server_id' => $this->server->id,
+                    'attempt' => $this->numberOfTries + 1,
+                    'missing_commands' => $validationResult['missing'],
+                    'found_commands' => $validationResult['found'],
+                ]);
+
+                // Install prerequisites
+                $this->server->installPrerequisites();
+
+                // Retry validation after installation
+                self::dispatch($this->server, $this->numberOfTries + 1)->delay(now()->addSeconds(30));
 
                 return;
             }
@@ -132,6 +169,9 @@ class ValidateAndInstallServerJob implements ShouldQueue
             if (! $this->server->isBuildServer()) {
                 $proxyShouldRun = CheckProxy::run($this->server, true);
                 if ($proxyShouldRun) {
+                    // Ensure networks exist BEFORE dispatching async proxy startup
+                    // This prevents race condition where proxy tries to start before networks are created
+                    instant_remote_process(ensureProxyNetworksExist($this->server)->toArray(), $this->server, false);
                     StartProxy::dispatch($this->server);
                 }
             }

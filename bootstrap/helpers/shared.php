@@ -33,6 +33,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\RateLimiter;
@@ -166,6 +167,10 @@ function currentTeam()
 
 function showBoarding(): bool
 {
+    if (isDev()) {
+        return false;
+    }
+
     if (Auth::user()?->isMember()) {
         return false;
     }
@@ -181,8 +186,11 @@ function refreshSession(?Team $team = null): void
             $team = User::find(Auth::id())->teams->first();
         }
     }
+    // Clear old cache key format for backwards compatibility
     Cache::forget('team:'.Auth::id());
-    Cache::remember('team:'.Auth::id(), 3600, function () use ($team) {
+    // Use new cache key format that includes team ID
+    Cache::forget('user:'.Auth::id().':team:'.$team->id);
+    Cache::remember('user:'.Auth::id().':team:'.$team->id, 3600, function () use ($team) {
         return $team;
     });
     session(['currentTeam' => $team]);
@@ -230,7 +238,7 @@ function get_route_parameters(): array
 function get_latest_sentinel_version(): string
 {
     try {
-        $response = Http::get('https://cdn.coollabs.io/coolify/versions.json');
+        $response = Http::get(config('constants.coolify.versions_url'));
         $versions = $response->json();
 
         return data_get($versions, 'coolify.sentinel.version');
@@ -241,10 +249,9 @@ function get_latest_sentinel_version(): string
 function get_latest_version_of_coolify(): string
 {
     try {
-        $versions = File::get(base_path('versions.json'));
-        $versions = json_decode($versions, true);
+        $versions = get_versions_data();
 
-        return data_get($versions, 'coolify.v4.version');
+        return data_get($versions, 'coolify.v4.version', '0.0.0');
     } catch (\Throwable $e) {
 
         return '0.0.0';
@@ -299,6 +306,24 @@ function generate_application_name(string $git_repository, string $git_branch, ?
     }
 
     return Str::kebab("$git_repository:$git_branch-$cuid");
+}
+
+/**
+ * Sort branches by priority: main first, master second, then alphabetically.
+ *
+ * @param  Collection  $branches  Collection of branch objects with 'name' key
+ */
+function sortBranchesByPriority(Collection $branches): Collection
+{
+    return $branches->sortBy(function ($branch) {
+        $name = data_get($branch, 'name');
+
+        return match ($name) {
+            'main' => '0_main',
+            'master' => '1_master',
+            default => '2_'.$name,
+        };
+    })->values();
 }
 
 function base_ip(): string
@@ -366,7 +391,7 @@ function base_url(bool $withPort = true): string
 
 function isSubscribed()
 {
-    return isSubscriptionActive() || auth()->user()->isInstanceAdmin();
+    return isSubscriptionActive();
 }
 
 function isProduction(): bool
@@ -423,17 +448,284 @@ function parseEnvFormatToArray($env_file_contents)
         $equals_pos = strpos($line, '=');
         if ($equals_pos !== false) {
             $key = substr($line, 0, $equals_pos);
-            $value = substr($line, $equals_pos + 1);
-            if (substr($value, 0, 1) === '"' && substr($value, -1) === '"') {
-                $value = substr($value, 1, -1);
-            } elseif (substr($value, 0, 1) === "'" && substr($value, -1) === "'") {
-                $value = substr($value, 1, -1);
+            $value_and_comment = substr($line, $equals_pos + 1);
+            $comment = null;
+            $remainder = '';
+
+            // Check if value starts with quotes
+            $firstChar = $value_and_comment[0] ?? '';
+            $isDoubleQuoted = $firstChar === '"';
+            $isSingleQuoted = $firstChar === "'";
+
+            if ($isDoubleQuoted) {
+                // Find the closing double quote
+                $closingPos = strpos($value_and_comment, '"', 1);
+                if ($closingPos !== false) {
+                    // Extract quoted value and remove quotes
+                    $value = substr($value_and_comment, 1, $closingPos - 1);
+                    // Everything after closing quote (including comments)
+                    $remainder = substr($value_and_comment, $closingPos + 1);
+                } else {
+                    // No closing quote - treat as unquoted
+                    $value = substr($value_and_comment, 1);
+                }
+            } elseif ($isSingleQuoted) {
+                // Find the closing single quote
+                $closingPos = strpos($value_and_comment, "'", 1);
+                if ($closingPos !== false) {
+                    // Extract quoted value and remove quotes
+                    $value = substr($value_and_comment, 1, $closingPos - 1);
+                    // Everything after closing quote (including comments)
+                    $remainder = substr($value_and_comment, $closingPos + 1);
+                } else {
+                    // No closing quote - treat as unquoted
+                    $value = substr($value_and_comment, 1);
+                }
+            } else {
+                // Unquoted value - strip inline comments
+                // Only treat # as comment if preceded by whitespace
+                if (preg_match('/\s+#/', $value_and_comment, $matches, PREG_OFFSET_CAPTURE)) {
+                    // Found whitespace followed by #, extract comment
+                    $remainder = substr($value_and_comment, $matches[0][1]);
+                    $value = substr($value_and_comment, 0, $matches[0][1]);
+                    $value = rtrim($value);
+                } else {
+                    $value = $value_and_comment;
+                }
             }
-            $env_array[$key] = $value;
+
+            // Extract comment from remainder (if any)
+            if ($remainder !== '') {
+                // Look for # in remainder
+                $hashPos = strpos($remainder, '#');
+                if ($hashPos !== false) {
+                    // Extract everything after the # and trim
+                    $comment = substr($remainder, $hashPos + 1);
+                    $comment = trim($comment);
+                    // Set to null if empty after trimming
+                    if ($comment === '') {
+                        $comment = null;
+                    }
+                }
+            }
+
+            $env_array[$key] = [
+                'value' => $value,
+                'comment' => $comment,
+            ];
         }
     }
 
     return $env_array;
+}
+
+/**
+ * Extract inline comments from environment variables in raw docker-compose YAML.
+ *
+ * Parses raw docker-compose YAML to extract inline comments from environment sections.
+ * Standard YAML parsers discard comments, so this pre-processes the raw text.
+ *
+ * Handles both formats:
+ * - Map format: `KEY: "value"  # comment` or `KEY: value  # comment`
+ * - Array format: `- KEY=value  # comment`
+ *
+ * @param  string  $rawYaml  The raw docker-compose.yml content
+ * @return array Map of environment variable keys to their inline comments
+ */
+function extractYamlEnvironmentComments(string $rawYaml): array
+{
+    $comments = [];
+    $lines = explode("\n", $rawYaml);
+    $inEnvironmentBlock = false;
+    $environmentIndent = 0;
+
+    foreach ($lines as $line) {
+        // Skip empty lines
+        if (trim($line) === '') {
+            continue;
+        }
+
+        // Calculate current line's indentation (number of leading spaces)
+        $currentIndent = strlen($line) - strlen(ltrim($line));
+
+        // Check if this line starts an environment block
+        if (preg_match('/^(\s*)environment\s*:\s*$/', $line, $matches)) {
+            $inEnvironmentBlock = true;
+            $environmentIndent = strlen($matches[1]);
+
+            continue;
+        }
+
+        // Check if this line starts an environment block with inline content (rare but possible)
+        if (preg_match('/^(\s*)environment\s*:\s*\{/', $line)) {
+            // Inline object format - not supported for comment extraction
+            continue;
+        }
+
+        // If we're in an environment block, check if we've exited it
+        if ($inEnvironmentBlock) {
+            // If we hit a line with same or less indentation that's not empty, we've left the block
+            // Unless it's a continuation of the environment block
+            $trimmedLine = ltrim($line);
+
+            // Check if this is a new top-level key (same indent as 'environment:' or less)
+            if ($currentIndent <= $environmentIndent && ! str_starts_with($trimmedLine, '-') && ! str_starts_with($trimmedLine, '#')) {
+                // Check if it looks like a YAML key (contains : not inside quotes)
+                if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*\s*:/', $trimmedLine)) {
+                    $inEnvironmentBlock = false;
+
+                    continue;
+                }
+            }
+
+            // Skip comment-only lines
+            if (str_starts_with($trimmedLine, '#')) {
+                continue;
+            }
+
+            // Try to extract environment variable and comment from this line
+            $extracted = extractEnvVarCommentFromYamlLine($trimmedLine);
+            if ($extracted !== null && $extracted['comment'] !== null) {
+                $comments[$extracted['key']] = $extracted['comment'];
+            }
+        }
+    }
+
+    return $comments;
+}
+
+/**
+ * Extract environment variable key and inline comment from a single YAML line.
+ *
+ * @param  string  $line  A trimmed line from the environment section
+ * @return array|null Array with 'key' and 'comment', or null if not an env var line
+ */
+function extractEnvVarCommentFromYamlLine(string $line): ?array
+{
+    $key = null;
+    $comment = null;
+
+    // Handle array format: `- KEY=value  # comment` or `- KEY  # comment`
+    if (str_starts_with($line, '-')) {
+        $content = ltrim(substr($line, 1));
+
+        // Check for KEY=value format
+        if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)/', $content, $keyMatch)) {
+            $key = $keyMatch[1];
+            // Find comment - need to handle quoted values
+            $comment = extractCommentAfterValue($content);
+        }
+    }
+    // Handle map format: `KEY: "value"  # comment` or `KEY: value  # comment`
+    elseif (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)\s*:/', $line, $keyMatch)) {
+        $key = $keyMatch[1];
+        // Get everything after the key and colon
+        $afterKey = substr($line, strlen($keyMatch[0]));
+        $comment = extractCommentAfterValue($afterKey);
+    }
+
+    if ($key === null) {
+        return null;
+    }
+
+    return [
+        'key' => $key,
+        'comment' => $comment,
+    ];
+}
+
+/**
+ * Extract inline comment from a value portion of a YAML line.
+ *
+ * Handles quoted values (where # inside quotes is not a comment).
+ *
+ * @param  string  $valueAndComment  The value portion (may include comment)
+ * @return string|null The comment text, or null if no comment
+ */
+function extractCommentAfterValue(string $valueAndComment): ?string
+{
+    $valueAndComment = ltrim($valueAndComment);
+
+    if ($valueAndComment === '') {
+        return null;
+    }
+
+    $firstChar = $valueAndComment[0] ?? '';
+
+    // Handle case where value is empty and line starts directly with comment
+    // e.g., `KEY:  # comment` becomes `# comment` after ltrim
+    if ($firstChar === '#') {
+        $comment = trim(substr($valueAndComment, 1));
+
+        return $comment !== '' ? $comment : null;
+    }
+
+    // Handle double-quoted value
+    if ($firstChar === '"') {
+        // Find closing quote (handle escaped quotes)
+        $pos = 1;
+        $len = strlen($valueAndComment);
+        while ($pos < $len) {
+            if ($valueAndComment[$pos] === '\\' && $pos + 1 < $len) {
+                $pos += 2; // Skip escaped character
+
+                continue;
+            }
+            if ($valueAndComment[$pos] === '"') {
+                // Found closing quote
+                $remainder = substr($valueAndComment, $pos + 1);
+
+                return extractCommentFromRemainder($remainder);
+            }
+            $pos++;
+        }
+
+        // No closing quote found
+        return null;
+    }
+
+    // Handle single-quoted value
+    if ($firstChar === "'") {
+        // Find closing quote (single quotes don't have escapes in YAML)
+        $closingPos = strpos($valueAndComment, "'", 1);
+        if ($closingPos !== false) {
+            $remainder = substr($valueAndComment, $closingPos + 1);
+
+            return extractCommentFromRemainder($remainder);
+        }
+
+        // No closing quote found
+        return null;
+    }
+
+    // Unquoted value - find # that's preceded by whitespace
+    // Be careful not to match # at the start of a value like color codes
+    if (preg_match('/\s+#\s*(.*)$/', $valueAndComment, $matches)) {
+        $comment = trim($matches[1]);
+
+        return $comment !== '' ? $comment : null;
+    }
+
+    return null;
+}
+
+/**
+ * Extract comment from the remainder of a line after a quoted value.
+ *
+ * @param  string  $remainder  Text after the closing quote
+ * @return string|null The comment text, or null if no comment
+ */
+function extractCommentFromRemainder(string $remainder): ?string
+{
+    // Look for # in remainder
+    $hashPos = strpos($remainder, '#');
+    if ($hashPos !== false) {
+        $comment = trim(substr($remainder, $hashPos + 1));
+
+        return $comment !== '' ? $comment : null;
+    }
+
+    return null;
 }
 
 function data_get_str($data, $key, $default = null): Stringable
@@ -530,7 +822,21 @@ function getResourceByUuid(string $uuid, ?int $teamId = null)
         return null;
     }
     $resource = queryResourcesByUuid($uuid);
-    if (! is_null($resource) && $resource->environment->project->team_id === $teamId) {
+    if (is_null($resource)) {
+        return null;
+    }
+
+    // ServiceDatabase has a different relationship path: service->environment->project->team_id
+    if ($resource instanceof \App\Models\ServiceDatabase) {
+        if ($resource->service?->environment?->project?->team_id === $teamId) {
+            return $resource;
+        }
+
+        return null;
+    }
+
+    // Standard resources: environment->project->team_id
+    if ($resource->environment->project->team_id === $teamId) {
         return $resource;
     }
 
@@ -617,6 +923,12 @@ function queryResourcesByUuid(string $uuid)
         return $clickhouse;
     }
 
+    // Check for ServiceDatabase by its own UUID
+    $serviceDatabase = ServiceDatabase::whereUuid($uuid)->first();
+    if ($serviceDatabase) {
+        return $serviceDatabase;
+    }
+
     return $resource;
 }
 function generateTagDeployWebhook($tag_name)
@@ -652,6 +964,12 @@ function generateGitManualWebhook($resource, $type)
 function removeAnsiColors($text)
 {
     return preg_replace('/\e[[][A-Za-z0-9];?[0-9]*m?/', '', $text);
+}
+
+function sanitizeLogsForExport(string $text): string
+{
+    // All sanitization is now handled by remove_iip()
+    return remove_iip($text);
 }
 
 function getTopLevelNetworks(Service|Application $resource)
@@ -942,6 +1260,9 @@ function generateEnvValue(string $command, Service|Application|null $service = n
         case 'USER':
             $generatedValue = Str::random(16);
             break;
+        case 'LOWERCASEUSER':
+            $generatedValue = Str::lower(Str::random(16));
+            break;
         case 'SUPABASEANON':
             $signingKey = $service->environment_variables()->where('key', 'SERVICE_PASSWORD_JWT')->first();
             if (is_null($signingKey)) {
@@ -1095,24 +1416,48 @@ function checkIPAgainstAllowlist($ip, $allowlist)
             }
 
             $mask = (int) $mask;
+            $isIpv6Subnet = filter_var($subnet, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+            $maxMask = $isIpv6Subnet ? 128 : 32;
 
-            // Validate mask
-            if ($mask < 0 || $mask > 32) {
+            // Validate mask for address family
+            if ($mask < 0 || $mask > $maxMask) {
                 continue;
             }
 
-            // Calculate network addresses
-            $ip_long = ip2long($ip);
-            $subnet_long = ip2long($subnet);
+            if ($isIpv6Subnet) {
+                // IPv6 CIDR matching using binary string comparison
+                $ipBin = inet_pton($ip);
+                $subnetBin = inet_pton($subnet);
 
-            if ($ip_long === false || $subnet_long === false) {
-                continue;
-            }
+                if ($ipBin === false || $subnetBin === false) {
+                    continue;
+                }
 
-            $mask_long = ~((1 << (32 - $mask)) - 1);
+                // Build a 128-bit mask from $mask prefix bits
+                $maskBin = str_repeat("\xff", (int) ($mask / 8));
+                $remainder = $mask % 8;
+                if ($remainder > 0) {
+                    $maskBin .= chr(0xFF & (0xFF << (8 - $remainder)));
+                }
+                $maskBin = str_pad($maskBin, 16, "\x00");
 
-            if (($ip_long & $mask_long) == ($subnet_long & $mask_long)) {
-                return true;
+                if (($ipBin & $maskBin) === ($subnetBin & $maskBin)) {
+                    return true;
+                }
+            } else {
+                // IPv4 CIDR matching
+                $ip_long = ip2long($ip);
+                $subnet_long = ip2long($subnet);
+
+                if ($ip_long === false || $subnet_long === false) {
+                    continue;
+                }
+
+                $mask_long = ~((1 << (32 - $mask)) - 1);
+
+                if (($ip_long & $mask_long) == ($subnet_long & $mask_long)) {
+                    return true;
+                }
             }
         } else {
             // Special case: 0.0.0.0 means allow all
@@ -1130,6 +1475,67 @@ function checkIPAgainstAllowlist($ip, $allowlist)
     return false;
 }
 
+function deduplicateAllowlist(array $entries): array
+{
+    if (count($entries) <= 1) {
+        return array_values($entries);
+    }
+
+    // Normalize each entry into [original, ip, mask]
+    $parsed = [];
+    foreach ($entries as $entry) {
+        $entry = trim($entry);
+        if (empty($entry)) {
+            continue;
+        }
+
+        if ($entry === '0.0.0.0') {
+            // Special case: bare 0.0.0.0 means "allow all" — treat as /0
+            $parsed[] = ['original' => $entry, 'ip' => '0.0.0.0', 'mask' => 0];
+        } elseif (str_contains($entry, '/')) {
+            [$ip, $mask] = explode('/', $entry);
+            $parsed[] = ['original' => $entry, 'ip' => $ip, 'mask' => (int) $mask];
+        } else {
+            $ip = $entry;
+            $isIpv6 = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+            $parsed[] = ['original' => $entry, 'ip' => $ip, 'mask' => $isIpv6 ? 128 : 32];
+        }
+    }
+
+    $count = count($parsed);
+    $redundant = array_fill(0, $count, false);
+
+    for ($i = 0; $i < $count; $i++) {
+        if ($redundant[$i]) {
+            continue;
+        }
+
+        for ($j = 0; $j < $count; $j++) {
+            if ($i === $j || $redundant[$j]) {
+                continue;
+            }
+
+            // Entry $j is redundant if its mask is narrower/equal (>=) than $i's mask
+            // AND $j's network IP falls within $i's CIDR range
+            if ($parsed[$j]['mask'] >= $parsed[$i]['mask']) {
+                $cidr = $parsed[$i]['ip'].'/'.$parsed[$i]['mask'];
+                if (checkIPAgainstAllowlist($parsed[$j]['ip'], [$cidr])) {
+                    $redundant[$j] = true;
+                }
+            }
+        }
+    }
+
+    $result = [];
+    for ($i = 0; $i < $count; $i++) {
+        if (! $redundant[$i]) {
+            $result[] = $parsed[$i]['original'];
+        }
+    }
+
+    return $result;
+}
+
 function get_public_ips()
 {
     try {
@@ -1140,7 +1546,7 @@ function get_public_ips()
         $ipv4 = $first->output();
         if ($ipv4) {
             $ipv4 = trim($ipv4);
-            $validate_ipv4 = filter_var($ipv4, FILTER_VALIDATE_IP);
+            $validate_ipv4 = filter_var($ipv4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
             if ($validate_ipv4 == false) {
                 echo "Invalid ipv4: $ipv4\n";
 
@@ -1155,7 +1561,7 @@ function get_public_ips()
         $ipv6 = $second->output();
         if ($ipv6) {
             $ipv6 = trim($ipv6);
-            $validate_ipv6 = filter_var($ipv6, FILTER_VALIDATE_IP);
+            $validate_ipv6 = filter_var($ipv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
             if ($validate_ipv6 == false) {
                 echo "Invalid ipv6: $ipv6\n";
 
@@ -1263,6 +1669,9 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
 {
     if ($resource->getMorphClass() === \App\Models\Service::class) {
         if ($resource->docker_compose_raw) {
+            // Extract inline comments from raw YAML before Symfony parser discards them
+            $envComments = extractYamlEnvironmentComments($resource->docker_compose_raw);
+
             try {
                 $yaml = Yaml::parse($resource->docker_compose_raw);
             } catch (\Exception $e) {
@@ -1294,7 +1703,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                 }
                 $topLevelVolumes = collect($tempTopLevelVolumes);
             }
-            $services = collect($services)->map(function ($service, $serviceName) use ($topLevelVolumes, $topLevelNetworks, $definedNetwork, $isNew, $generatedServiceFQDNS, $resource, $allServices) {
+            $services = collect($services)->map(function ($service, $serviceName) use ($topLevelVolumes, $topLevelNetworks, $definedNetwork, $isNew, $generatedServiceFQDNS, $resource, $allServices, $envComments) {
                 // Workarounds for beta users.
                 if ($serviceName === 'registry') {
                     $tempServiceName = 'docker-registry';
@@ -1353,51 +1762,70 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
 
                 // Decide if the service is a database
                 $image = data_get_str($service, 'image');
-                $isDatabase = isDatabaseImage($image, $service);
-                data_set($service, 'is_database', $isDatabase);
 
-                // Create new serviceApplication or serviceDatabase
-                if ($isDatabase) {
-                    if ($isNew) {
-                        $savedService = ServiceDatabase::create([
-                            'name' => $serviceName,
-                            'image' => $image,
-                            'service_id' => $resource->id,
-                        ]);
-                    } else {
-                        $savedService = ServiceDatabase::where([
-                            'name' => $serviceName,
-                            'service_id' => $resource->id,
-                        ])->first();
-                        if (is_null($savedService)) {
+                // Check for manually migrated services first (respects user's conversion choice)
+                $migratedApp = ServiceApplication::where('name', $serviceName)
+                    ->where('service_id', $resource->id)
+                    ->where('is_migrated', true)
+                    ->first();
+                $migratedDb = ServiceDatabase::where('name', $serviceName)
+                    ->where('service_id', $resource->id)
+                    ->where('is_migrated', true)
+                    ->first();
+
+                if ($migratedApp || $migratedDb) {
+                    // Use the migrated service type, ignoring image detection
+                    $isDatabase = (bool) $migratedDb;
+                    $savedService = $migratedApp ?: $migratedDb;
+                } else {
+                    // Use image detection for non-migrated services
+                    $isDatabase = isDatabaseImage($image, $service);
+
+                    // Create new serviceApplication or serviceDatabase
+                    if ($isDatabase) {
+                        if ($isNew) {
                             $savedService = ServiceDatabase::create([
                                 'name' => $serviceName,
                                 'image' => $image,
                                 'service_id' => $resource->id,
                             ]);
+                        } else {
+                            $savedService = ServiceDatabase::where([
+                                'name' => $serviceName,
+                                'service_id' => $resource->id,
+                            ])->first();
+                            if (is_null($savedService)) {
+                                $savedService = ServiceDatabase::create([
+                                    'name' => $serviceName,
+                                    'image' => $image,
+                                    'service_id' => $resource->id,
+                                ]);
+                            }
                         }
-                    }
-                } else {
-                    if ($isNew) {
-                        $savedService = ServiceApplication::create([
-                            'name' => $serviceName,
-                            'image' => $image,
-                            'service_id' => $resource->id,
-                        ]);
                     } else {
-                        $savedService = ServiceApplication::where([
-                            'name' => $serviceName,
-                            'service_id' => $resource->id,
-                        ])->first();
-                        if (is_null($savedService)) {
+                        if ($isNew) {
                             $savedService = ServiceApplication::create([
                                 'name' => $serviceName,
                                 'image' => $image,
                                 'service_id' => $resource->id,
                             ]);
+                        } else {
+                            $savedService = ServiceApplication::where([
+                                'name' => $serviceName,
+                                'service_id' => $resource->id,
+                            ])->first();
+                            if (is_null($savedService)) {
+                                $savedService = ServiceApplication::create([
+                                    'name' => $serviceName,
+                                    'image' => $image,
+                                    'service_id' => $resource->id,
+                                ]);
+                            }
                         }
                     }
                 }
+
+                data_set($service, 'is_database', $isDatabase);
 
                 // Check if image changed
                 if ($savedService->image !== $image) {
@@ -1621,6 +2049,8 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                         $key = str($variableName);
                         $value = str($variable);
                     }
+                    // Preserve original key for comment lookup before $key might be reassigned
+                    $originalKey = $key->value();
                     if ($key->startsWith('SERVICE_FQDN')) {
                         if ($isNew || $savedService->fqdn === null) {
                             $name = $key->after('SERVICE_FQDN_')->beforeLast('_')->lower();
@@ -1674,6 +2104,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                 'resourceable_type' => get_class($resource),
                                 'resourceable_id' => $resource->id,
                                 'is_preview' => false,
+                                'comment' => $envComments[$originalKey] ?? null,
                             ]);
                         }
                         // Caddy needs exact port in some cases.
@@ -1753,6 +2184,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                             'resourceable_type' => get_class($resource),
                                             'resourceable_id' => $resource->id,
                                             'is_preview' => false,
+                                            'comment' => $envComments[$originalKey] ?? null,
                                         ]);
                                     }
                                     if (! $isDatabase) {
@@ -1791,6 +2223,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                             'resourceable_type' => get_class($resource),
                                             'resourceable_id' => $resource->id,
                                             'is_preview' => false,
+                                            'comment' => $envComments[$originalKey] ?? null,
                                         ]);
                                     }
                                 }
@@ -1829,6 +2262,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                 'resourceable_type' => get_class($resource),
                                 'resourceable_id' => $resource->id,
                                 'is_preview' => false,
+                                'comment' => $envComments[$originalKey] ?? null,
                             ]);
                         }
                     }
@@ -2879,6 +3313,35 @@ function instanceSettings()
     return InstanceSettings::get();
 }
 
+function wireNavigate(): string
+{
+    try {
+        $settings = instanceSettings();
+
+        // Return wire:navigate.hover for SPA navigation with prefetching, or empty string if disabled
+        return ($settings->is_wire_navigate_enabled ?? true) ? 'wire:navigate.hover' : '';
+    } catch (\Exception $e) {
+        return 'wire:navigate.hover';
+    }
+}
+
+/**
+ * Redirect to a named route with SPA navigation support.
+ * Automatically uses wire:navigate when is_wire_navigate_enabled is true.
+ */
+function redirectRoute(Livewire\Component $component, string $name, array $parameters = []): mixed
+{
+    $navigate = true;
+
+    try {
+        $navigate = instanceSettings()->is_wire_navigate_enabled ?? true;
+    } catch (\Exception $e) {
+        $navigate = true;
+    }
+
+    return $component->redirectRoute($name, $parameters, navigate: $navigate);
+}
+
 function getHelperVersion(): string
 {
     $settings = instanceSettings();
@@ -3134,4 +3597,343 @@ function generateDockerComposeServiceName(mixed $services, int $pullRequestId = 
     }
 
     return $collection;
+}
+
+function formatBytes(?int $bytes, int $precision = 2): string
+{
+    if ($bytes === null || $bytes === 0) {
+        return '0 B';
+    }
+
+    // Handle negative numbers
+    if ($bytes < 0) {
+        return '0 B';
+    }
+
+    $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    $base = 1024;
+    $exponent = floor(log($bytes) / log($base));
+    $exponent = min($exponent, count($units) - 1);
+
+    $value = $bytes / pow($base, $exponent);
+
+    return round($value, $precision).' '.$units[$exponent];
+}
+
+/**
+ * Validates that a file path is safely within the /tmp/ directory.
+ * Protects against path traversal attacks by resolving the real path
+ * and verifying it stays within /tmp/.
+ *
+ * Note: On macOS, /tmp is often a symlink to /private/tmp, which is handled.
+ */
+function isSafeTmpPath(?string $path): bool
+{
+    if (blank($path)) {
+        return false;
+    }
+
+    // URL decode to catch encoded traversal attempts
+    $decodedPath = urldecode($path);
+
+    // Minimum length check - /tmp/x is 6 chars
+    if (strlen($decodedPath) < 6) {
+        return false;
+    }
+
+    // Must start with /tmp/
+    if (! str($decodedPath)->startsWith('/tmp/')) {
+        return false;
+    }
+
+    // Quick check for obvious traversal attempts
+    if (str($decodedPath)->contains('..')) {
+        return false;
+    }
+
+    // Check for null bytes (directory traversal technique)
+    if (str($decodedPath)->contains("\0")) {
+        return false;
+    }
+
+    // Remove any trailing slashes for consistent validation
+    $normalizedPath = rtrim($decodedPath, '/');
+
+    // Normalize the path by removing redundant separators and resolving . and ..
+    // We'll do this manually since realpath() requires the path to exist
+    $parts = explode('/', $normalizedPath);
+    $resolvedParts = [];
+
+    foreach ($parts as $part) {
+        if ($part === '' || $part === '.') {
+            // Skip empty parts (from //) and current directory references
+            continue;
+        } elseif ($part === '..') {
+            // Parent directory - this should have been caught earlier but double-check
+            return false;
+        } else {
+            $resolvedParts[] = $part;
+        }
+    }
+
+    $resolvedPath = '/'.implode('/', $resolvedParts);
+
+    // Final check: resolved path must start with /tmp/
+    // And must have at least one component after /tmp/
+    if (! str($resolvedPath)->startsWith('/tmp/') || $resolvedPath === '/tmp') {
+        return false;
+    }
+
+    // Resolve the canonical /tmp path (handles symlinks like /tmp -> /private/tmp on macOS)
+    $canonicalTmpPath = realpath('/tmp');
+    if ($canonicalTmpPath === false) {
+        // If /tmp doesn't exist, something is very wrong, but allow non-existing paths
+        $canonicalTmpPath = '/tmp';
+    }
+
+    // Calculate dirname once to avoid redundant calls
+    $dirPath = dirname($resolvedPath);
+
+    // If the directory exists, resolve it via realpath to catch symlink attacks
+    if (is_dir($dirPath)) {
+        // For existing paths, resolve to absolute path to catch symlinks
+        $realDir = realpath($dirPath);
+        if ($realDir === false) {
+            return false;
+        }
+
+        // Check if the real directory is within /tmp (or its canonical path)
+        if (! str($realDir)->startsWith('/tmp') && ! str($realDir)->startsWith($canonicalTmpPath)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Transform colon-delimited status format to human-readable parentheses format.
+ *
+ * Handles Docker container status formats with optional health check status and exclusion modifiers.
+ *
+ * Examples:
+ * - running:healthy → Running (healthy)
+ * - running:unhealthy:excluded → Running (unhealthy, excluded)
+ * - exited:excluded → Exited (excluded)
+ * - Proxy:running → Proxy:running (preserved as-is for headline formatting)
+ * - running → Running
+ *
+ * @param  string  $status  The status string to format
+ * @return string The formatted status string
+ */
+function formatContainerStatus(string $status): string
+{
+    // Preserve Proxy statuses as-is (they follow different format)
+    if (str($status)->startsWith('Proxy')) {
+        return str($status)->headline()->value();
+    }
+
+    // Check for :excluded suffix
+    $isExcluded = str($status)->endsWith(':excluded');
+    $parts = explode(':', $status);
+
+    if ($isExcluded) {
+        if (count($parts) === 3) {
+            // Has health status: running:unhealthy:excluded → Running (unhealthy, excluded)
+            return str($parts[0])->headline().' ('.$parts[1].', excluded)';
+        } else {
+            // No health status: exited:excluded → Exited (excluded)
+            return str($parts[0])->headline().' (excluded)';
+        }
+    } elseif (count($parts) >= 2) {
+        // Regular colon format: running:healthy → Running (healthy)
+        return str($parts[0])->headline().' ('.$parts[1].')';
+    } else {
+        // Simple status: running → Running
+        return str($status)->headline()->value();
+    }
+}
+
+/**
+ * Check if password confirmation should be skipped.
+ * Returns true if:
+ * - Two-step confirmation is globally disabled
+ * - User has no password (OAuth users)
+ *
+ * Used by modal-confirmation.blade.php to determine if password step should be shown.
+ *
+ * @return bool True if password confirmation should be skipped
+ */
+function shouldSkipPasswordConfirmation(): bool
+{
+    // Skip if two-step confirmation is globally disabled
+    if (data_get(InstanceSettings::get(), 'disable_two_step_confirmation')) {
+        return true;
+    }
+
+    // Skip if user has no password (OAuth users)
+    if (! Auth::user()?->hasPassword()) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Verify password for two-step confirmation.
+ * Skips verification if:
+ * - Two-step confirmation is globally disabled
+ * - User has no password (OAuth users)
+ *
+ * @param  mixed  $password  The password to verify (may be array if skipped by frontend)
+ * @param  \Livewire\Component|null  $component  Optional Livewire component to add errors to
+ * @return bool True if verification passed (or skipped), false if password is incorrect
+ */
+function verifyPasswordConfirmation(mixed $password, ?Livewire\Component $component = null): bool
+{
+    // Skip if password confirmation should be skipped
+    if (shouldSkipPasswordConfirmation()) {
+        return true;
+    }
+
+    // Verify the password
+    if (! Hash::check($password, Auth::user()->password)) {
+        if ($component) {
+            $component->addError('password', 'The provided password is incorrect.');
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Extract hard-coded environment variables from docker-compose YAML.
+ *
+ * @param  string  $dockerComposeRaw  Raw YAML content
+ * @return \Illuminate\Support\Collection Collection of arrays with: key, value, comment, service_name
+ */
+function extractHardcodedEnvironmentVariables(string $dockerComposeRaw): \Illuminate\Support\Collection
+{
+    if (blank($dockerComposeRaw)) {
+        return collect([]);
+    }
+
+    try {
+        $yaml = \Symfony\Component\Yaml\Yaml::parse($dockerComposeRaw);
+    } catch (\Exception $e) {
+        // Malformed YAML - return empty collection
+        return collect([]);
+    }
+
+    $services = data_get($yaml, 'services', []);
+    if (empty($services)) {
+        return collect([]);
+    }
+
+    // Extract inline comments from raw YAML
+    $envComments = extractYamlEnvironmentComments($dockerComposeRaw);
+
+    $hardcodedVars = collect([]);
+
+    foreach ($services as $serviceName => $service) {
+        $environment = collect(data_get($service, 'environment', []));
+
+        if ($environment->isEmpty()) {
+            continue;
+        }
+
+        // Convert environment variables to key-value format
+        $environment = convertToKeyValueCollection($environment);
+
+        foreach ($environment as $key => $value) {
+            $hardcodedVars->push([
+                'key' => $key,
+                'value' => $value,
+                'comment' => $envComments[$key] ?? null,
+                'service_name' => $serviceName,
+            ]);
+        }
+    }
+
+    return $hardcodedVars;
+}
+
+/**
+ * Downsample metrics using the Largest-Triangle-Three-Buckets (LTTB) algorithm.
+ * This preserves the visual shape of the data better than simple averaging.
+ *
+ * @param  array  $data  Array of [timestamp, value] pairs
+ * @param  int  $threshold  Target number of points
+ * @return array Downsampled data
+ */
+function downsampleLTTB(array $data, int $threshold): array
+{
+    $dataLength = count($data);
+
+    // Return unchanged if threshold >= data length, or if threshold <= 2
+    // (threshold <= 2 would cause division by zero in bucket calculation)
+    if ($threshold >= $dataLength || $threshold <= 2) {
+        return $data;
+    }
+
+    $sampled = [];
+    $sampled[] = $data[0]; // Always keep first point
+
+    $bucketSize = ($dataLength - 2) / ($threshold - 2);
+
+    $a = 0; // Index of previous selected point
+
+    for ($i = 0; $i < $threshold - 2; $i++) {
+        // Calculate bucket range
+        $bucketStart = (int) floor(($i + 1) * $bucketSize) + 1;
+        $bucketEnd = (int) floor(($i + 2) * $bucketSize) + 1;
+        $bucketEnd = min($bucketEnd, $dataLength - 1);
+
+        // Calculate average point for next bucket (used as reference)
+        $nextBucketStart = (int) floor(($i + 2) * $bucketSize) + 1;
+        $nextBucketEnd = (int) floor(($i + 3) * $bucketSize) + 1;
+        $nextBucketEnd = min($nextBucketEnd, $dataLength - 1);
+
+        $avgX = 0;
+        $avgY = 0;
+        $nextBucketCount = $nextBucketEnd - $nextBucketStart + 1;
+
+        if ($nextBucketCount > 0) {
+            for ($j = $nextBucketStart; $j <= $nextBucketEnd; $j++) {
+                $avgX += $data[$j][0];
+                $avgY += $data[$j][1];
+            }
+            $avgX /= $nextBucketCount;
+            $avgY /= $nextBucketCount;
+        }
+
+        // Find point in current bucket with largest triangle area
+        $maxArea = -1;
+        $maxAreaIndex = $bucketStart;
+
+        $pointAX = $data[$a][0];
+        $pointAY = $data[$a][1];
+
+        for ($j = $bucketStart; $j <= $bucketEnd; $j++) {
+            // Triangle area calculation
+            $area = abs(
+                ($pointAX - $avgX) * ($data[$j][1] - $pointAY) -
+                ($pointAX - $data[$j][0]) * ($avgY - $pointAY)
+            ) * 0.5;
+
+            if ($area > $maxArea) {
+                $maxArea = $area;
+                $maxAreaIndex = $j;
+            }
+        }
+
+        $sampled[] = $data[$maxAreaIndex];
+        $a = $maxAreaIndex;
+    }
+
+    $sampled[] = $data[$dataLength - 1]; // Always keep last point
+
+    return $sampled;
 }

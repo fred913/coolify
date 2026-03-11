@@ -30,12 +30,14 @@ class InstallDocker
             );
             $caCertPath = config('constants.coolify.base_config_path').'/ssl/';
 
+            $base64Cert = base64_encode($serverCert->ssl_certificate);
+
             $commands = collect([
                 "mkdir -p $caCertPath",
                 "chown -R 9999:root $caCertPath",
                 "chmod -R 700 $caCertPath",
                 "rm -rf $caCertPath/coolify-ca.crt",
-                "echo '{$serverCert->ssl_certificate}' > $caCertPath/coolify-ca.crt",
+                "echo '{$base64Cert}' | base64 -d | tee $caCertPath/coolify-ca.crt > /dev/null",
                 "chmod 644 $caCertPath/coolify-ca.crt",
             ]);
             remote_process($commands, $server);
@@ -59,8 +61,6 @@ class InstallDocker
         $command = collect([]);
         if (isDev() && $server->id === 0) {
             $command = $command->merge([
-                "echo 'Installing Prerequisites...'",
-                'sleep 1',
                 "echo 'Installing Docker Engine...'",
                 "echo 'Configuring Docker Engine (merging existing configuration with the required)...'",
                 'sleep 4',
@@ -70,35 +70,6 @@ class InstallDocker
 
             return remote_process($command, $server);
         } else {
-            if ($supported_os_type->contains('debian')) {
-                $command = $command->merge([
-                    "echo 'Installing Prerequisites...'",
-                    'apt-get update -y',
-                    'command -v curl >/dev/null || apt install -y curl',
-                    'command -v wget >/dev/null || apt install -y wget',
-                    'command -v git >/dev/null || apt install -y git',
-                    'command -v jq >/dev/null || apt install -y jq',
-                ]);
-            } elseif ($supported_os_type->contains('rhel')) {
-                $command = $command->merge([
-                    "echo 'Installing Prerequisites...'",
-                    'command -v curl >/dev/null || dnf install -y curl',
-                    'command -v wget >/dev/null || dnf install -y wget',
-                    'command -v git >/dev/null || dnf install -y git',
-                    'command -v jq >/dev/null || dnf install -y jq',
-                ]);
-            } elseif ($supported_os_type->contains('sles')) {
-                $command = $command->merge([
-                    "echo 'Installing Prerequisites...'",
-                    'zypper update -y',
-                    'command -v curl >/dev/null || zypper install -y curl',
-                    'command -v wget >/dev/null || zypper install -y wget',
-                    'command -v git >/dev/null || zypper install -y git',
-                    'command -v jq >/dev/null || zypper install -y jq',
-                ]);
-            } else {
-                throw new \Exception('Unsupported OS');
-            }
             $command = $command->merge([
                 "echo 'Installing Docker Engine...'",
             ]);
@@ -109,6 +80,8 @@ class InstallDocker
                 $command = $command->merge([$this->getRhelDockerInstallCommand()]);
             } elseif ($supported_os_type->contains('sles')) {
                 $command = $command->merge([$this->getSuseDockerInstallCommand()]);
+            } elseif ($supported_os_type->contains('arch')) {
+                $command = $command->merge([$this->getArchDockerInstallCommand()]);
             } else {
                 $command = $command->merge([$this->getGenericDockerInstallCommand()]);
             }
@@ -146,11 +119,11 @@ class InstallDocker
     private function getDebianDockerInstallCommand(): string
     {
         return "curl --max-time 300 --retry 3 https://releases.rancher.com/install-docker/{$this->dockerVersion}.sh | sh || curl --max-time 300 --retry 3 https://get.docker.com | sh -s -- --version {$this->dockerVersion} || (".
-            'install -m 0755 -d /etc/apt/keyrings && '.
-            'curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && '.
-            'chmod a+r /etc/apt/keyrings/docker.asc && '.
             '. /etc/os-release && '.
-            'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list && '.
+            'install -m 0755 -d /etc/apt/keyrings && '.
+            'curl -fsSL https://download.docker.com/linux/${ID}/gpg -o /etc/apt/keyrings/docker.asc && '.
+            'chmod a+r /etc/apt/keyrings/docker.asc && '.
+            'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list && '.
             'apt-get update && '.
             'apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'.
             ')';
@@ -177,8 +150,19 @@ class InstallDocker
             ')';
     }
 
+    private function getArchDockerInstallCommand(): string
+    {
+        // Use -Syu to perform full system upgrade before installing Docker
+        // Partial upgrades (-Sy without -u) are discouraged on Arch Linux
+        // as they can lead to broken dependencies and system instability
+        // Use --needed to skip reinstalling packages that are already up-to-date (idempotent)
+        return 'pacman -Syu --noconfirm --needed docker docker-compose && '.
+            'systemctl enable docker.service && '.
+            'systemctl start docker.service';
+    }
+
     private function getGenericDockerInstallCommand(): string
     {
-        return "curl https://releases.rancher.com/install-docker/{$this->dockerVersion}.sh | sh || curl https://get.docker.com | sh -s -- --version {$this->dockerVersion}";
+        return "curl --max-time 300 --retry 3 https://releases.rancher.com/install-docker/{$this->dockerVersion}.sh | sh || curl --max-time 300 --retry 3 https://get.docker.com | sh -s -- --version {$this->dockerVersion}";
     }
 }

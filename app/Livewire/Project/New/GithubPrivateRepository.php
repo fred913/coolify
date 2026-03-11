@@ -75,14 +75,9 @@ class GithubPrivateRepository extends Component
         $this->github_apps = GithubApp::private();
     }
 
-    public function updatedBaseDirectory()
+    public function updatedSelectedRepositoryId(): void
     {
-        if ($this->base_directory) {
-            $this->base_directory = rtrim($this->base_directory, '/');
-            if (! str($this->base_directory)->startsWith('/')) {
-                $this->base_directory = '/'.$this->base_directory;
-            }
-        }
+        $this->loadBranches();
     }
 
     public function updatedBuildPack()
@@ -138,6 +133,7 @@ class GithubPrivateRepository extends Component
                 $this->loadBranchByPage();
             }
         }
+        $this->branches = sortBranchesByPriority($this->branches);
         $this->selected_branch_name = data_get($this->branches, '0.name', 'main');
     }
 
@@ -167,10 +163,12 @@ class GithubPrivateRepository extends Component
                 'selected_repository_owner' => $this->selected_repository_owner,
                 'selected_repository_repo' => $this->selected_repository_repo,
                 'selected_branch_name' => $this->selected_branch_name,
+                'docker_compose_location' => $this->docker_compose_location,
             ], [
                 'selected_repository_owner' => 'required|string|regex:/^[a-zA-Z0-9\-_]+$/',
                 'selected_repository_repo' => 'required|string|regex:/^[a-zA-Z0-9\-_\.]+$/',
                 'selected_branch_name' => ['required', 'string', new ValidGitBranch],
+                'docker_compose_location' => ['nullable', 'string', 'max:255', 'regex:/^\/[a-zA-Z0-9._\-\/]+$/'],
             ]);
 
             if ($validator->fails()) {
