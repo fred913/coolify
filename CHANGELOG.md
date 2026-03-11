@@ -4623,6 +4623,7 @@ All notable changes to this project will be documented in this file.
 - *(parser)* Use firstOrCreate instead of updateOrCreate for environment variables
 - *(env-parser)* Capture clean variable names without trailing braces in bash-style defaults (#8855)
 - *(terminal)* Resolve WebSocket connection and host authorization issues (#8862)
+- Use custom SSH port for deploy_key in fetch/submodule/lfs (fixes #7139)
 
 ### 💼 Other
 
@@ -5867,6 +5868,7 @@ All notable changes to this project will be documented in this file.
 - *(application)* Add comments explaining commit selection logic for rollback support
 - *(readme)* Add VPSDime to Big Sponsors list
 - *(readme)* Move MVPS to Huge Sponsors section
+- Update changelog
 
 ### ⚡ Performance
 
